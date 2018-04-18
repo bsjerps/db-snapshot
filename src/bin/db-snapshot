@@ -1,0 +1,501 @@
+#!/bin/bash
+#============================================================================
+# Title       : db-snapshot
+# Description : Creates cloned database from storage snapshot
+# Author      : Bart Sjerps <bart@outrun.nl>
+# License     : GPLv3+
+# ---------------------------------------------------------------------------
+#============================================================================
+# Configuration parameters:
+# ---------------------------------------------------------------------------
+#============================================================================
+# Usage:
+# ---------------------------------------------------------------------------
+usage() {
+  cat <<- EOF
+	$(basename $0) <parameters>
+	
+	Clones an Oracle database from an ASM based storage snapshot.
+	
+	During the clone process the database and datafiles will be renamed,
+	the file structure will be created (audit dirs, init.ora etc),
+	archive logging will be disabled. The database will be recovered until the
+	last available archivelog and shut down after cloning.
+	
+	Existing init.ora parameters from the source database will be used except
+	for file locations, and memory requirements will be set to use less than
+	1GB of memory. Enough hugepages must be available if the source database
+	also uses hugepages.
+	
+	The controlfile and spfile must be backed up in the sourcedir (i.e. using
+	RMAN autobackup) as they are used to re-generate parameter files and the
+	new controlfile.
+	
+	Parameters:
+	  -d - debug (switch to temp directory before quitting)
+	  -s - startup database (normal) after creation
+	
+	  --orahome <dir>   - use <dir> as ORACLE_HOME instead of default
+	  --ctrlfile <file> - use this controlfile backup to restore database
+	  --datadest        - datafile destination (default /oradata)
+	  --redodest        - redolog destination (default=datadest)
+	  --tempdest        - tempfile destination (default=datadest)
+	  --archdest        - archivelog destination (default=datadest)
+	  --tempsize        - Use this size (MB) instead of original temp size
+	  --sgatarget       - Use this sgatarget (MB) instead of default (768)
+	  --pgatarget       - Use this pgatarget (MB) instead of default (256)
+	
+	
+	EOF
+}
+
+#============================================================================
+# Initialization - Logging - Etc.
+# ---------------------------------------------------------------------------
+die() { echo "$(basename $0): [die] $@" >&2 ; exit 10 ;}
+err() { echo "$(basename $0): [err] $@" ; exit 20 ;}
+
+case $(id -un) in
+  oracle) ;;
+  *)      die "Run as user oracle" && exit 1 ;;
+esac
+
+# Make temp dir and make variable readonly
+readonly WORKDIR=$(mktemp -d)
+cleanup() { rm -rf $WORKDIR ; }
+trap cleanup INT TERM HUP EXIT
+
+unset ORACLE_SID
+unset ORACLE_HOME
+unset ORACLE_BASE
+
+export SQLPATH=$WORKDIR
+
+#============================================================================
+# Functions
+# ---------------------------------------------------------------------------
+
+sqlheader=$(printf "set heading off\nset feedback off\nset verify off\nwhenever sqlerror exit 2;\n\n")
+sql()    { printf "$sqlheader\n$@\n" | $ORACLE_HOME/bin/sqlplus -L -S / as sysdba; }
+sqlasm() { printf "$sqlheader\n$@\n" | $ORACLE_HOME/bin/sqlplus -L -S $ASMUSER/$ASMPASS@$ASMCONNECT as sysasm; }
+
+cleanup_src() {
+  export ORACLE_SID=$SRCSID
+  cat <<- EOF > $WORKDIR/cleanup.sql
+	SET SERVEROUTPUT ON
+	DECLARE
+	  A NUMBER;
+	BEGIN
+	  SELECT COUNT(status) INTO A FROM v\$backup where status='ACTIVE';
+	  -- DBMS_OUTPUT.PUT_LINE('Backup mode ' || A);
+	  if(A>0) THEN
+	    DBMS_OUTPUT.PUT_LINE('Cleanup: Ending backup mode ');
+	    EXECUTE IMMEDIATE('alter database end backup');
+	  end if;
+	END;
+	/
+	exit;
+	EOF
+  sql @$WORKDIR/cleanup.sql
+  cleanup
+}
+
+purgelogs() {
+  export ORACLE_SID=$SRCSID
+  if [ "${PURGELOGS^^}" == "Y" ]; then
+    echo purging archive logs
+    rman target / <<< "delete noprompt archivelog all;" > $WORKDIR/rman.out
+  fi
+}
+
+avail() {
+  export ORACLE_SID=$SRCSID
+  case $(sql "select status from v\$instance;" | grep -E "ORA|OPEN|MOUNTED|STARTED") in
+    OPEN)       return 0 ;;
+    ORA-01034*) return 1 ;; # down
+    ORA-01012*) return 4 ;; # not logged on
+    STARTED)    return 2 ;; # startup nomount
+    MOUNTED)    return 3 ;; # startup mount
+    *)          return 255 ;;
+  esac
+}
+
+stopdb() {
+  export ORACLE_SID=$TGTSID
+  echo Stopping database $ORACLE_SID
+  sql "shutdown abort;"
+}
+
+stopsrc() {
+  export ORACLE_SID=$SRCSID
+  echo Shutting down database $ORACLE_SID
+  sql "shutdown immediate;"
+}
+
+startsrc() {
+  export ORACLE_SID=$SRCSID
+  echo Starting database $ORACLE_SID
+  sql "startup"
+}
+
+restartdb() {
+  export ORACLE_SID=$TGTSID
+  echo restarting database $ORACLE_SID
+  sql "shutdown immediate;"
+  sql "startup;"
+}
+
+asm_unmount() {
+  echo Unmounting and dropping cloned ASM disks:
+  sleep 1
+  cat <<- EOF > $WORKDIR/unmount.sql
+	SET SERVEROUTPUT ON
+	DECLARE
+	  DGNAME VARCHAR2(30);
+	  CURSOR cur IS SELECT name from v\$asm_diskgroup where name like '${ASMPREFIX}_%' and STATE in ('MOUNTED');
+	BEGIN
+	  OPEN cur;
+	  LOOP
+	    FETCH cur into DGNAME;
+	    EXIT WHEN cur%NOTFOUND;
+	    DBMS_OUTPUT.PUT_LINE('Drop diskgroup ' || DGNAME);
+	    -- EXECUTE IMMEDIATE('ALTER DISKGROUP ' || DGNAME || ' DISMOUNT');
+	    EXECUTE IMMEDIATE('DROP DISKGROUP ' || DGNAME || ' INCLUDING CONTENTS');
+	  END LOOP;
+	  CLOSE cur;
+	END;
+	/
+	EOF
+  sqlasm @unmount.sql
+}
+
+asm_mount() {
+  echo Mounting cloned ASM disks:
+  for DG in $(getdiskgroups); do
+    echo Mounting ${ASMPREFIX}_${DG}
+    sqlasm "alter diskgroup ${ASMPREFIX}_${DG} mount;" || return 10
+  done
+}
+
+getpfile() {
+  export ORACLE_SID=$SRCSID
+  echo retrieving init.ora
+  SPFILE=$(sql "select value from v\$parameter where name='spfile';" | awk 'NF>0 {print $NF}')
+  test -n "$SPFILE" || die "spfile required"
+  sql "CREATE PFILE='$WORKDIR/init.ora' FROM SPFILE='$SPFILE';"
+}
+
+getctrlfile() {
+  export ORACLE_SID=$SRCSID
+  echo retrieving trace.sql
+  sql "ALTER DATABASE BACKUP CONTROLFILE TO TRACE AS '$WORKDIR/trace.sql';" || return 10
+  echo retrieving control.bkup
+  sql "alter database backup controlfile to '$WORKDIR/control.bkup';"       || return 10
+}
+
+getdisks() {
+  export ORACLE_SID=$SRCSID
+  echo "Disks required:"
+  cat <<- EOF > $WORKDIR/disks.sql
+	SELECT path from v\$asm_disk D JOIN v\$asm_diskgroup G ON G.group_number = D.group_number
+	WHERE G.name in (select substr(name,2,instr(name,'/')-2) from v\$datafile
+	UNION select substr(name,2,instr(name,'/')-2) from v\$tempfile
+	UNION select substr(member,2,instr(member,'/')-2) from v\$logfile)
+	/
+	EOF
+  sql @$WORKDIR/disks.sql | awk 'NF>0 {print $NF}'
+}
+
+beginbackup() {
+  export ORACLE_SID=$SRCSID
+  echo Starting hot backup mode on $ORACLE_SID
+  sql "select max(sequence#) from v\$log;" | awk 'NF>0 {print $NF}' > $WORKDIR/beginseq
+  sql "alter system checkpoint;"            || return $?
+  sql "alter system switch logfile;"        || return $?
+  sql "alter database begin backup;"        || return $?
+}
+
+snapshot() {
+  echo "running $SNAPCOMMAND" 
+  $SNAPCOMMAND
+}
+
+# select current_scn from v\$database" | awk 'NF>0 {print $NF}' > $WORKDIR/scn
+endbackup() {
+  export ORACLE_SID=$SRCSID
+  echo Ending hot backup mode on $ORACLE_SID
+  sql "alter database end backup;" || return 10
+  sleep 1
+  sql "select current_scn from v\$database;" | awk 'NF>0 {print $NF}' > $WORKDIR/scn
+  sql "alter system switch logfile;" || return $?
+  sql "alter system switch logfile;" || return $?
+  sql "select max(sequence#) from v\$log;" | awk 'NF>0 {print $NF}' > $WORKDIR/endseq
+}
+
+copylogs() {
+  export ORACLE_SID=$SRCSID
+  read bseq < $WORKDIR/beginseq
+  read eseq < $WORKDIR/endseq
+  echo copying archivelogs between sequence ${bseq:-unset} and ${eseq:-unset} on $ORACLE_SID
+  cat <<- EOF > $WORKDIR/copyfiles.sql
+	SET SERVEROUTPUT ON
+	DECLARE
+	  FULLNAME VARCHAR2(513);
+	  DIRNAME  VARCHAR2(513);
+	  BASENAME VARCHAR2(513);
+	  NEWNAME  VARCHAR2(513);
+	  THREAD   NUMBER;
+	  SEQ      NUMBER;
+	  RID      NUMBER;
+	  CURSOR cur IS SELECT name, substr(name,instr(name,'/',-1,1)+1) as bname, thread#, sequence#, resetlogs_id
+	  FROM v\$archived_log a where status='A' and sequence# between ${bseq:-0} and ${eseq:-0};
+	BEGIN
+	  SELECT substr(name,1,instr(name,'/',-1,1)) INTO DIRNAME
+	  FROM v\$archived_log where status='A' and sequence#=(select max(sequence#) from v\$archived_log);
+	  EXECUTE IMMEDIATE('CREATE OR REPLACE DIRECTORY archdir as ''' || DIRNAME || '''');
+	  EXECUTE IMMEDIATE('CREATE OR REPLACE DIRECTORY workdir as ''' || '$WORKDIR' || '''');
+	  OPEN cur;
+	  LOOP
+	    FETCH cur into FULLNAME,BASENAME,THREAD,SEQ,RID;
+	    EXIT WHEN cur%NOTFOUND;
+	    NEWNAME := thread || '_' || seq || '_' || rid || '.dbf';
+	    DBMS_OUTPUT.PUT_LINE('Archive log ' || NEWNAME);
+	    DBMS_FILE_TRANSFER.COPY_FILE('archdir',BASENAME,'workdir',NEWNAME);
+	  END LOOP;
+	  CLOSE cur;
+	  EXECUTE IMMEDIATE('DROP DIRECTORY archdir');
+	  EXECUTE IMMEDIATE('DROP DIRECTORY workdir');
+	END;
+	/
+	exit;
+	EOF
+  sql @copyfiles.sql
+}
+
+getdiskgroups() { 
+  (
+  awk 'BEGIN {f=0;}{if($1=="DATAFILE"){f+=1;next;};if(f>1){if($1$2=="CHARACTERSET")exit;print $1}}' $WORKDIR/trace.sql
+  awk 'BEGIN {f=0;}{if($1=="LOGFILE"){f+=1;next;};if(f>1){if($1!="GROUP")exit;print $3}}' $WORKDIR/trace.sql
+  awk 'BEGIN {f=0;}{if($5=="TEMPFILE"){f+=1;};if(f>1){if($1=="SIZE")exit;print $NF}}' $WORKDIR/trace.sql
+  ) | cut -d \' -f2 | awk -F/ '/^+/ {print $1}' | sort | uniq | tr -d '+' 
+}
+
+dgrename() {
+  mkdir -p $WORKDIR/asm
+  echo diskgroups to be renamed: $(getdiskgroups)
+  for disk in $(sqlasm "select path from gv\$asm_disk where group_number=0;" | awk 'NF>0 {print $NF}'); do
+    echo found unmounted disk ${disk:-none}
+    ln -sf $disk $WORKDIR/asm/
+  done
+  for dg in $(getdiskgroups); do
+    renamedg phase=both config=$WORKDIR/renamedg_config \
+      dgname=$dg newdgname=${ASMPREFIX}_${dg} asm_diskstring=$WORKDIR/asm | fold -sw 80
+    rc=${PIPESTATUS[0]}
+    ((rc==0)) || return $rc
+  done
+}
+
+mkinitora() {
+  audit_file_dest=${ORACLE_BASE}/admin/${TGTSID}/adump
+  mkdir -p $audit_file_dest
+  create_dest=$(awk -F= '/db_create_file_dest/ {print $NF}' $WORKDIR/init.ora | tr -d \')
+  grep -wqs "^$TGTSID" /etc/oratab || echo "$TGTSID:$ORACLE_HOME:N" >> /etc/oratab
+  cat $WORKDIR/init.ora | awk '/^*./'                                          \
+    | sed "s|control_files=.*|control_files='$create_dest/$TGTSID/copy1.ctl'|" \
+    | sed "s|+\([[:alnum:]]\+\)|+${ASMPREFIX}_\1|"                             \
+    | sed "s|audit_file_dest=.*|audit_file_dest='$audit_file_dest'|"           \
+    | sed "s|db_name=.*|db_name='$TGTSID'|"                                    \
+    | sed "/sga_max_size/d"                                                    \
+    | sed "/sga_target/d"                                                      \
+    | sed "/pga_target/d"                                                      \
+    | sed "/log_archive_format/d"                                              \
+    | sed "\$a\*.sga_target=$sgatarget"                                        \
+    | sed "\$a\*.pga_aggregate_target=$pgatarget"                              \
+    > $WORKDIR/pfile.ora
+}
+
+renamedb() {
+  export ORACLE_SID=$TGTSID
+  awk -v NEW=$TGTSID -v OLD=$SRCSID '
+    BEGIN { f=0; }
+    { if ($1$2=="CREATECONTROLFILE") { f+=1; sub($5,NEW) };
+      if (f>1) {
+        gsub(/REUSE/,"SET")
+        gsub(/ARCHIVELOG/,"NOARCHIVELOG")
+        gsub(/FORCE LOGGING /,"")
+        if ($1==";") f=0
+        print $0;
+      }
+    }
+    ' $WORKDIR/trace.sql |   sed "s|+\([[:alnum:]]\+\)|+${ASMPREFIX}_\1|" > $WORKDIR/rename.sql
+  sql "startup nomount pfile='$WORKDIR/pfile.ora'"
+  sql "@$WORKDIR/rename.sql"
+}
+
+recoverdb() {
+  echo ORA-00279, ORA-00280 and ORA-00289 messages are normal and can be ignored
+  export ORACLE_SID=$TGTSID
+  read scn < $WORKDIR/scn
+  cat <<- EOF > $WORKDIR/recover.sql
+	WHENEVER SQLERROR CONTINUE
+	SET AUTORECOVERY ON
+	SET LOGSOURCE "$WORKDIR"
+	recover database until change $scn using backup controlfile;
+	EOF
+  sql @$WORKDIR/recover.sql
+}
+resetlogs() {
+  export ORACLE_SID=$TGTSID
+  SPFILE=$(awk -F= '/db_create_file_dest/ {print $NF}' $WORKDIR/pfile.ora|tr -d \')/$TGTSID/spfile${TGTSID}.ora
+  echo "SPFILE='$SPFILE'" > $ORACLE_HOME/dbs/init${TGTSID}.ora
+  sql "alter database open resetlogs;" || die "Open resetlogs failed"
+  sql "create spfile='$SPFILE' from pfile='$WORKDIR/pfile.ora';"
+  sql "select 'open mode: ' || open_mode from v\$database;"
+}
+
+tempfile() {
+  export ORACLE_SID=$TGTSID
+  awk 'BEGIN {f=0;}{if($1$2=="ALTERTABLESPACE"){f+=1;};if(f>1){if($1=="SIZE")f=0;print $0}}' $WORKDIR/trace.sql |\
+    tr -d '\n' | sed "s|+\([[:alnum:]]\+\)|+${ASMPREFIX}_\1|" > $WORKDIR/tempfile.sql
+  sql @$WORKDIR/tempfile.sql
+}
+
+dosrc() {
+  trap cleanup_src INT TERM HUP EXIT
+  doprep       || die "Prepare SRC failed"
+  $SNAPCOMMAND || die "Snapshot command failed"
+  dofinalize   || die "Finalize SRC failed"
+}
+
+remote() {
+  self=/tmp/$(basename $0)
+  p="--src $SRCSID --cmd $SNAPCOMMAND"
+  scp -q $0 ${SRCHOST}:${self}                || err "scp script to $SRCHOST failed"
+  timeout 300 ssh -qT ${SRCHOST} $self $p dosrc  || err "Remote commands failed"
+  scp -q ${SRCHOST}:/tmp/package.tar $WORKDIR || err "scp tar failed"
+  tar -x -C $WORKDIR -f $WORKDIR/package.tar  || err "untar failed"
+}
+
+# --- wrappers
+
+cmd() {
+  # set timeout?
+  (
+  echo "--> Execute "$@" @ $HOSTNAME "
+  $@ 2>&1
+  ) | awk '{ print strftime("[%Y-%m-%d %T] "), $0 }'
+  return ${PIPESTATUS[0]}
+}
+
+dostop() {
+  cmd stopdb      || die "Can't stop copy database"
+  cmd asm_unmount || die "Can't unmount copy diskgroup(s)"
+}
+
+doprep() {
+  avail               || die "Database $SRCSID not open"
+  cmd purgelogs       || die "Purging archivelogs failed"
+  cmd getpfile        || die "Get init.ora failed"
+  cmd getctrlfile     || die "Get trace.sql failed"
+  cmd getdisks        || die "Can't report disks"
+  case ${METHOD,,} in
+    cold) cmd stopsrc     || die "Stopping source DB failed" ;;
+    hot)  cmd beginbackup || die "Hot backup mode failed" ;;
+    *)    die "Unknown method $METHOD" ;;
+  esac
+}
+
+dofinalize() {
+  case ${METHOD,,} in
+    cold) cmd startsrc  || echo "Starting source DB failed, continue..." ;;
+    hot)  cmd endbackup || die "End backup failed"
+          cmd copylogs  || die "Copy archivelogs failed"
+          ;;
+    *)    die "Unknown method $METHOD" ;;
+  esac
+  tar -cf /tmp/package.tar -C $WORKDIR . || die "Creating tar archive failed"
+}
+
+doclone() {
+  cmd dgrename    || die "Rename ASM diskgroup failed"
+  cmd asm_mount   || die "Can't mount copy diskgroup(s)"
+  cmd mkinitora   || die "Create init.ora failed"
+  cmd renamedb    || die "Renaming database failed"
+  case ${METHOD,,} in
+    hot)  cmd recoverdb   || die "Recover clone database failed" ;;
+    cold) ;;
+    *)    die "Unknown method $METHOD" ;;
+  esac
+  cmd resetlogs   || die "Open resetlogs failed"
+  cmd tempfile    || die "Tempfile creation failed"
+  cmd restartdb   || die "Restart clone database failed"
+}
+
+doall() {
+  dostop
+  remote
+  doclone
+}
+
+testsql () { 
+  echo here
+  export ORACLE_SID=$SRCSID
+  sql "select max(sequence#) from v\$log;" | awk 'NF>0 {print $NF}'
+}
+
+#============================================================================
+# Main section - parsing options etc
+# ---------------------------------------------------------------------------
+
+while getopts ":hc:d-:s" OPT; do
+  case "$OPT" in
+    -) [[ "${!OPTIND:0:1}" == "-" ]] && die "no parameter for option ${OPTARG}"
+       case "${OPTARG}" in
+         srv) SRCHOST=${!OPTIND} ; ((OPTIND++)) ;;
+         src) SRCSID=${!OPTIND} ; ((OPTIND++)) ;;
+         tgt) TGTSID=${!OPTIND} ; ((OPTIND++)) ;;
+         cmd) SNAPCOMMAND=${!OPTIND} ; ((OPTIND++)) ;;
+         sga) sgatarget=${!OPTIND} ; ((OPTIND++)) ;;
+         pga) pgatarget=${!OPTIND} ; ((OPTIND++)) ;;
+         *)   die "unknown long option $OPTARG" ;;
+       esac ;;
+    c) conf="$OPTARG" ;;
+    d) debug=Y ;;
+    s) start=Y ;;
+ \?|h) usage ; exit ;;
+  esac
+done
+shift $(expr $OPTIND - 1)
+
+### DEFAULT PARAMETERS ###
+: ${METHOD:=HOT}
+: ${ASMCONNECT:=//$(hostname)/+asm}
+: ${ASMUSER:=asmsnmp}
+: ${ASMPASS:=outrun}
+: ${ASMPREFIX:=COPY}
+: ${PURGELOGS:=Y}
+: ${sgatarget:=512m}
+: ${pgatarget:=256m}
+: ${SRCHOST:=localhost}
+
+# Mandatory
+# SRCHOST=outrun01
+# SRCSID=DEMO
+# TGTSID=SNAP
+# SNAPCOMMAND="/usr/test/bin/isnap"
+
+export ORACLE_HOME=$(awk -v src=${SRCSID:-none} -v tgt=${TGTSID:-none} -F: '$1==src || $1==tgt {print $2 ; exit }' /etc/oratab)
+export ORAENV_ASK=NO
+export PATH=$ORACLE_HOME/bin:$PATH
+export ORACLE_BASE=$(orabase)
+
+ACTION=$1 ; shift
+case $ACTION in
+  stop)  dostop  ;;
+  prep)  doprep  ;;
+  fin*)  dofinalize ;;
+  clone) doclone ;;
+  "")    doall   ;;
+  *)     $ACTION ;;
+esac
+
