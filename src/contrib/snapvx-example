@@ -1,0 +1,29 @@
+#!/bin/bash
+
+# Example on how to refresh pre-configured snapshots on VMAX using SnapVX
+
+PATH=$PATH:/opt/emc/SYMCLI/bin
+die() { echo "$(basename $0): [die] $@" >&2 ; exit 10 ;}
+
+# Set the correct SYMMETRIX SYMMID in the environment first
+test -n "$SYMMID" || die "SYMMID not set"
+
+# Wrapper for sudo so non-root users can run this. Setup a line in /etc/sudoers.d to do this.
+# Remove sudo if you intend to run this as root only
+symsnapvx() { sudo /opt/emc/SYMCLI/bin/symsnapvx $@ ; }
+
+# Set a prefix to prevent multiple hosts messing up the same snapshot
+PREFIX=${HOSTNAME}_
+
+# Create a new snapshot for the DATA and REDO storage groups
+symsnapvx -sid $SYMMID -sg ${PREFIX}_DATA -noprompt -name ${PREFIX}_DATA_SNAP establish
+symsnapvx -sid $SYMMID -sg ${PREFIX}_REDO -noprompt -name ${PREFIX}_REDO_SNAP establish
+
+# Relink the _LNK volumes to the new snapshot
+symsnapvx -sid $SYMMID -sg ${PREFIX}_DATA -noprompt -lnsg ${PREFIX}_DATA_LNK -snapshot_name ${PREFIX}_DATA_SNAP relink
+symsnapvx -sid $SYMMID -sg ${PREFIX}_REDO -noprompt -lnsg ${PREFIX}_REDO_LNK -snapshot_name ${PREFIX}_REDO_SNAP relink
+
+# clean up older snapshots that are no longer used
+symsnapvx -sid $SYMMID -sg ${PREFIX}_DATA -noprompt -snapshot_name ${PREFIX}_DATA_SNAP -generation 1 terminate
+symsnapvx -sid $SYMMID -sg ${PREFIX}_REDO -noprompt -snapshot_name ${PREFIX}_REDO_SNAP -generation 1 terminate
+
