@@ -470,11 +470,6 @@ doall() {
   clone
 }
 
-testsql () { 
-  export ORACLE_SID=$SRCSID
-  sql "select max(sequence#) from v\$log;" | awk 'NF>0 {print $NF}'
-}
-
 #============================================================================
 # Main section - parsing options etc
 # ---------------------------------------------------------------------------
@@ -492,7 +487,7 @@ while getopts ":hc:D-:s" OPT; do
          pga) pgatarget=${!OPTIND}   ; ((OPTIND++)) ;;
          *)   die "unknown long option $OPTARG" ;;
        esac ;;
-    c) conf="$OPTARG" ;;
+    c) test -f $OPTARG && source $OPTARG ;;
     D) DEBUG=Y ;;
     s) start=Y ;;
  \?|h) usage ; exit ;;
@@ -504,15 +499,16 @@ shift $(expr $OPTIND - 1)
 : ${METHOD:=HOT}
 : ${ASMCONNECT:=//$(hostname)/+asm}
 : ${ASMUSER:=asmsnmp}
-: ${ASMPASS:=outrun}
+: ${ASMPASS:=secret}
 : ${ASMPREFIX:=COPY}
-: ${PURGELOGS:=Y}
+: ${PURGELOGS:=N}
 : ${sgatarget:=768m}
 : ${pgatarget:=256m}
 : ${SRCHOST:=localhost}
 
 test -n "$ORACLE_HOME" \
-  || export ORACLE_HOME=$(awk -v src=${SRCSID:-none} -v tgt=${TGTSID:-none} -F: '$1==src || $1==tgt {print $2 ; exit }' /etc/oratab)
+  || export ORACLE_HOME=$(awk -v src=${SRCSID:-none} -v tgt=${TGTSID:-none} -F: '$1==src \
+  || $1==tgt {print $2 ; exit }' /etc/oratab)
 
 export ORACLE_HOME
 export ORAENV_ASK=NO
@@ -529,7 +525,7 @@ case $ACTION in
   fin*)  finalize ;;
   clone) clone ;;
   "")    doall   ;;
-  *)     $ACTION ;;
+  *)     die "Unknown action $ACTION" ;;
 esac
 
 # test -z "$DEBUG" && debug
