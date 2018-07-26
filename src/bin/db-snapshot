@@ -403,7 +403,7 @@ remote() {
   timeout 60 ssh -qT ${SRCHOST} $self --src $SRCSID prep     || die "Prepare failed"
   cmd $SNAPCOMMAND                                           || die "Snapshot failed"
   timeout 60 ssh -qT ${SRCHOST} $self --src $SRCSID finalize || die "Finalize failed"
-  timeout 60 ssh -qT ${SRCHOST} $self arch | tar -x --strip-components=1 -C $WORKDIR -f - \
+  timeout 300 ssh -qT ${SRCHOST} $self arch | tar -x --strip-components=1 -C $WORKDIR -f - \
    || die "remote tar failed"
 }
 
