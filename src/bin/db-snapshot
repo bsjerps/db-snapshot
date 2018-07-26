@@ -220,9 +220,11 @@ getdisks() {
 beginbackup() {
   export ORACLE_SID=$SRCSID
   echo Starting hot backup mode on $ORACLE_SID
-  sql "select max(sequence#) from v\$log;" | awk 'NF>0 {print $NF}' > $SWAPDIR/beginseq
   sql "alter system checkpoint;"            || return $?
-  sql "alter system switch logfile;"        || return $?
+  sql "alter system archive log current;"   || return $?
+  sql "alter system archive log current;"   || return $?
+  sql "alter system archive log current;"   || return $?
+  sql "select max(sequence#) from v\$log;" | awk 'NF>0 {print $NF}' > $SWAPDIR/beginseq
   sql "alter database begin backup;"        || return $?
 }
 
@@ -238,8 +240,7 @@ endbackup() {
   sql "alter database end backup;" || return 10
   sleep 1
   sql "select current_scn from v\$database;" | awk 'NF>0 {print $NF}' > $SWAPDIR/scn
-  sql "alter system switch logfile;" || return $?
-  sql "alter system switch logfile;" || return $?
+  sql "alter system archive log current;"   || return $?
   sql "select max(sequence#) from v\$log;" | awk 'NF>0 {print $NF}' > $SWAPDIR/endseq
 }
 
