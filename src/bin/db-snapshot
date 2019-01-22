@@ -5,56 +5,6 @@
 # Author      : Bart Sjerps <bart@outrun.nl>
 # License     : GPLv3+
 # ---------------------------------------------------------------------------
-#============================================================================
-# Configuration parameters:
-# ---------------------------------------------------------------------------
-#============================================================================
-# Usage:
-# ---------------------------------------------------------------------------
-usage() {
-  cat <<- EOF
-	$(basename $0) <parameters> [action]
-	
-	Clones an Oracle database from an ASM based storage snapshot.
-	
-	During the clone process the database and datafiles will be renamed,
-	the file structure will be created (audit dirs, init.ora etc),
-	archive logging will be disabled. The database will be recovered until the
-	last available archivelog and shut down after cloning.
-	
-	Existing init.ora parameters from the source database will be used except
-	for file locations, and memory requirements will be set to use less than
-	1GB of memory. Enough hugepages must be available if the source database
-	also uses hugepages.
-	
-	$(basename $0) should run as user 'oracle' and must have password-less
-	ssh access from the copy to the source host.
-	
-	Parameters:
-	  -c <configfile>   - read settings from <configfile>
-	  -D                - debug (switch to temp directory before quitting)
-	  -s                - startup database (normal) after creation
-	  --srv <host>      - set source DB hostname
-	  --src <sid>       - specify source database sid
-	  --tgt <sid>       - specify target  database sid
-	  --cmd <cmd>       - specify snapshot refresh command/script
-	  --sga <size>      - specify target sga size
-	  --pga <size>      - specify target pga size
-	Actions:
-	  stop       - stop source database, unmount ASM diskgroups
-	  prep       - run the prepare stage on the source host
-	  finalize   - run the finalize stage on the source host
-	  clone      - run the cloning stage on the target host
-	  <default>  - run entire cloning cycle
-	
-	The command specified with --cmd should have the instructions to create/update
-	a snapshot on some kind of storage array or other cloning facility.
-	
-	Example:
-	  $(basename $0) --src demo --tgt clone --cmd /usr/local/bin/snaprefresh
-	
-	EOF
-}
 
 #============================================================================
 # Initialization - Logging - Etc.
@@ -63,11 +13,6 @@ usage() {
 debug() { cd $WORKDIR && bash ; }
 die() { echo "$(basename $0): [die] $@" >&2 ; exit 10 ;}
 err() { echo "$(basename $0): [err] $@" ; exit 20 ;}
-
-case $(id -un) in
-  oracle) ;;
-  *)      die "Run as user oracle" && exit 1 ;;
-esac
 
 # Make temp dir and make variable readonly
 readonly WORKDIR=$(mktemp -d)
@@ -474,26 +419,32 @@ doall() {
 # Main section - parsing options etc
 # ---------------------------------------------------------------------------
 
-while getopts ":hc:D-:s" OPT; do
+case $1 in
+  -\?|--help) man $(basename $0) ; exit ;;
+esac
+
+while getopts ":hc:D-:" OPT; do
   case "$OPT" in
     -) [[ "${!OPTIND:0:1}" == "-" ]] && die "no parameter for option ${OPTARG}"
        case "${OPTARG}" in
-         srv) SRCHOST=${!OPTIND}     ; ((OPTIND++)) ;;
-         src) SRCSID=${!OPTIND}      ; ((OPTIND++)) ;;
-         tgt) TGTSID=${!OPTIND}      ; ((OPTIND++)) ;;
-         oh)  ORACLE_HOME=${!OPTIND} ; ((OPTIND++)) ;;
-         cmd) SNAPCOMMAND=${!OPTIND} ; ((OPTIND++)) ;;
-         sga) sgatarget=${!OPTIND}   ; ((OPTIND++)) ;;
-         pga) pgatarget=${!OPTIND}   ; ((OPTIND++)) ;;
+         srv)  SRCHOST=${!OPTIND}     ; ((OPTIND++)) ;;
+         src)  SRCSID=${!OPTIND}      ; ((OPTIND++)) ;;
+         tgt)  TGTSID=${!OPTIND}      ; ((OPTIND++)) ;;
+         oh)   ORACLE_HOME=${!OPTIND} ; ((OPTIND++)) ;;
+         cmd)  SNAPCOMMAND=${!OPTIND} ; ((OPTIND++)) ;;
+         sga)  sgatarget=${!OPTIND}   ; ((OPTIND++)) ;;
+         pga)  pgatarget=${!OPTIND}   ; ((OPTIND++)) ;;
+         help) man $(basename $0); exit ;;
          *)   die "unknown long option $OPTARG" ;;
        esac ;;
     c) test -f $OPTARG && source $OPTARG ;;
     D) DEBUG=Y ;;
-    s) start=Y ;;
- \?|h) usage ; exit ;;
+    ?) die "Unknown option -$OPTARG" ;;
   esac
 done
 shift $(expr $OPTIND - 1)
+
+test $(id -un) = "oracle" || die "Run as user oracle"
 
 ### DEFAULT PARAMETERS ###
 : ${METHOD:=HOT}

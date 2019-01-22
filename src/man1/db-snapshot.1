@@ -1,0 +1,82 @@
+.TH DB-SNAPSHOT "1" "January 2019" "Outrun" "Outrun manual"
+.SH NAME
+db-snapshot
+- clone an Oracle database from an ASM based storage snapshot
+.SH SYNOPSIS
+.B db-snapshot
+[options] [stop|prep|finalize|clone]
+.SH DESCRIPTION
+During the clone process the database and datafiles will be renamed,
+the file structure will be created (audit dirs, init.ora etc),
+archive logging will be disabled. The database will be recovered until the
+last available archivelog and shut down after cloning.
+.P
+Existing init.ora parameters from the source database will be used except
+for file locations, and memory requirements will be set to use less than
+1GB of memory. Enough hugepages must be available if the source database
+also uses hugepages.
+.P
+.B db-snapshot
+should run as user 'oracle' and must have password-less ssh access from the copy to the source host.
+If the source host and target host are the same, password-less ssh access must still be configured
+on the localhost.
+.SH OPTIONS
+.TP
+-c <config file>
+Load <config file> for options
+.TP
+-D
+Enable debugging
+.TP
+--srv <host>
+use <host> as source database host
+.TP
+--src <sid>
+use <sid> as source database SID
+.TP
+--tgt <sid>
+use <sid> as target database SID
+.TP
+--cmd <cmd>
+call <cmd> to refresh storage snapshots. The command specified 
+should have the instructions to create/update
+a snapshot on some kind of storage array or other cloning facility.
+.TP
+--sga <size>
+use <size> as new SGA_TARGET size for cloned database
+.TP
+--pga <size>
+use <size> as new PGA_TARGET size for cloned database
+.TP
+stop
+Stop and unmount cloned database
+.TP
+prep
+run the prepare stage on the source host
+.TP
+finalize
+run the finalize stage on the source host
+.TP
+clone
+run the cloning stage on the target host
+.TP
+<none>
+Run the entire cloning cycle
+.SH EXAMPLE
+.nf
+db-snapshot --src DEMO --tgt CLONE --cmd /usr/local/bin/snaprefresh
+.fi
+Clones the DEMO database on the same host to the CLONE database. A script 
+named 'snap' must be in the path which refreshes the storage snapshot
+.nf
+.P
+db-snapshot --src DEMO --tgt CLONE stop
+.fi
+Stops the CLONE database and unmounts the cloned ASM disk groups.
+.SH COPYRIGHT
+Copyright \(co 2018 Bart Sjerps <bart@outrun.nl>
+License GPLv3+: GNU GPL version 3 or later <http://gnu.org/licenses/gpl.html>.
+.br
+This is free software: you are free to change and redistribute it. There is NO WARRANTY, to the extent permitted by law.
+.PP
+If you have suggestions for improvements in this tool, please send them along via the above address.
